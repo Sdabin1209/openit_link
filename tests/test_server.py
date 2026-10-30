@@ -216,3 +216,42 @@ class V030(unittest.TestCase):
         c, _, b = self.raw("GET", "/readyz")
         self.assertEqual((c, json.loads(b)), (503, {"status": "not-ready"}))
         self.assertEqual(json.loads(self.raw("GET", "/readyz", headers=self.OP)[2])["db"], "secret-host:5432")
+
+
+class V040(unittest.TestCase):
+    """0.4.0: 405·413 본문도 BoundaryError, on_result 감사 훅(성공·거부 모두, 요청마다 따로)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.seen = []
+        routes = [Route("POST", "/v1/w", lambda r: Response(201, {"ok": True}), roles=frozenset({"operator"}), require_user=True, max_body=10)]
+        cls.app = App(routes, {"op-token-0123456789": {"role": "operator", "actor": "svc"}}, on_result=cls.seen.append)
+        cls.srv = waitress.create_server(cls.app, host="127.0.0.1", port=0)
+        cls.port = cls.srv.effective_port
+        threading.Thread(target=cls.srv.run, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.close()
+
+    def raw(self, method, data=b"", headers=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/w", method=method, data=data or None)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    def test_405_413_본문은_BoundaryError(self):
+        for (c, h, b), want in ((self.raw("GET"), 405), (self.raw("POST", b"x" * 100, {"Authorization": "Bearer op-token-0123456789"}), 413)):
+            rec = json.loads(b)
+            self.assertEqual((c, rec["code"]), (want, "INVALID_RECORD"))
+            self.assertEqual(list(validator("BoundaryError").iter_errors(rec)), [])
+
+    def test_on_result는_거부도_기록한다(self):
+        self.seen.clear()
+        self.raw("POST", b"{}", {"Authorization": "Bearer op-token-0123456789", "Content-Type": "application/json"})
+        self.raw("POST", b"{}", {"Authorization": "Bearer op-token-0123456789", "X-Openit-User": "kim", "Content-Type": "application/json"})
+        got = [(x["status"], x["code"], x["actor"], x["user"]) for x in self.seen]
+        self.assertEqual(got, [(401, "PERMISSION_DENIED", "svc", None), (201, None, "svc", "kim")])

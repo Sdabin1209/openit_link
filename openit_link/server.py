@@ -86,7 +86,8 @@ class App:
 
     def __init__(self, routes: list[Route], tokens: Mapping[str, str], *, ready: Optional[Callable[[], tuple]] = None,
                  user_header_trusted: bool = True, authenticate: Optional[Callable[[Mapping[str, str]], Optional[tuple]]] = None,
-                 ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = 64):
+                 ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = 64,
+                 on_result: Optional[Callable[[dict], None]] = None):
         """authenticate(0.3.0): 토큰이 없을 때 부르는 추가 인증(예: 게이트웨이가 확인한 X-Openit-Device를 믿는 내부망 경로, ADR 0012).
         요청 머리글(소문자 이름) → (역할, 호출자 ID) 또는 None. ready_public(0.3.0): 인증되지 않은 /readyz 호출에 줄 본문(사유를 감춘다);
         인증된 호출(토큰 표의 토큰)에는 ready()의 본문 전체를 준다. max_json_depth(0.3.0): JSON 중첩 상한(넘으면 400, 재귀 한도로 죽지 않게)."""
@@ -98,6 +99,9 @@ class App:
         self._authenticate = authenticate
         self._ready_public = ready_public
         self._max_depth = max_json_depth
+        # on_result(0.4.0): 경로가 있는 요청이 끝날 때마다(성공·거부·실패 모두) {"method","pattern","status","code","role","actor","user","params"}로 부른다.
+        # 감사 기록용(누가 무엇을 시도했다가 왜 거부됐나). 훅의 예외는 응답을 바꾸지 않는다(기록 실패가 요청 실패가 되지 않게)
+        self._on_result = on_result
 
     # ---- WSGI ----
     def __call__(self, environ, start_response):
@@ -106,6 +110,22 @@ class App:
         return [body] if isinstance(body, (bytes, bytearray)) else body   # 반복자는 WSGI 서버가 나눠 보낸다(PEP 3333)
 
     def handle(self, environ) -> tuple:
+        ctx: dict = {}   # 요청마다 따로(waitress는 여러 스레드에서 동시에 부른다)
+        out = self._handle(environ, ctx)
+        if self._on_result is not None and ctx:
+            try:
+                code = None
+                if out[0] >= 400 and isinstance(out[2], (bytes, bytearray)):
+                    try:
+                        code = json.loads(out[2]).get("code")
+                    except ValueError:
+                        code = None
+                self._on_result({**ctx, "status": out[0], "code": code})
+            except Exception:   # noqa: BLE001 — 기록 실패가 응답을 바꾸지 않는다
+                pass
+        return out
+
+    def _handle(self, environ, ctx: dict) -> tuple:
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "/")
         raw_path = (environ.get("REQUEST_URI") or environ.get("RAW_URI") or "").split("?", 1)[0]   # 0.2.0: %2F를 보존한 원래 경로(waitress·gunicorn이 준다)
@@ -118,6 +138,10 @@ class App:
                     info = self._ready_public(info)
                 return self._json(200 if ok else 503, info)
             route, params = self._match(method, raw_path or path, encoded=bool(raw_path))
+            principal = self._principal(environ)
+            ctx.update({"method": method, "pattern": route.pattern, "params": dict(params),
+                         "role": principal[0] if principal else None, "actor": principal[1] if principal else None,
+                         "user": environ.get("HTTP_X_OPENIT_USER") if self._user_trusted else None})
             if route.stream_body:
                 stream = self._stream(environ, route.max_body)
                 raw = b""
@@ -149,8 +173,10 @@ class App:
             st, headers, data = self._error(e.error)
             headers.update(e.headers)
             return st, headers, data
-        except _HttpOnly as e:
-            return e.status, {"Content-Type": "application/json", **e.headers}, json.dumps({"message": e.message}, ensure_ascii=False).encode()
+        except _HttpOnly as e:   # 0.4.0: 405·413도 본문은 BoundaryError(CONVENTIONS 9절 "실패는 BoundaryError 레코드"). 코드는 INVALID_RECORD, 원래 상태는 http_status
+            st, headers, data = self._error(BoundaryError("INVALID_RECORD", e.message, {"http_status": e.status}))
+            headers.update(e.headers)
+            return st, headers, data
 
     # ---- 내부 ----
     def _match(self, method: str, path: str, encoded: bool = False):
