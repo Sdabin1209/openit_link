@@ -98,3 +98,50 @@ class Clients(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V020(unittest.TestCase):
+    """0.2.0: $defs 참조, 쿼리 검증, 호출자 ID, 상수 시간 비교, 스트리밍, %2F 보존, 405 Allow."""
+    @classmethod
+    def setUpClass(cls):
+        def stream(req):
+            return Response(200, (b"x" * 1024 for _ in range(4)), content_type="application/octet-stream")
+        routes = [Route("POST", "/v1/purge", lambda r: Response(200, r.body), roles=frozenset({"operator"}),
+                        request_schema="QuestionAuthoringDeployInterface#/$defs/PurgeResult"),
+                  Route("GET", "/v1/files/{path}", lambda r: Response(200, {"path": r.params["path"], "actor": r.actor}), roles=frozenset({"operator"})),
+                  Route("GET", "/v1/stream", stream, roles=frozenset({"operator"}))]
+        cls.app = App(routes, {"op-token-0123456789": {"role": "operator", "actor": "svc-a"}})
+        cls.srv = waitress.create_server(cls.app, host="127.0.0.1", port=0)
+        cls.port = cls.srv.effective_port
+        threading.Thread(target=cls.srv.run, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.close()
+
+    def raw(self, method, path, data=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method, data=data)
+        req.add_header("Authorization", "Bearer op-token-0123456789")
+        if data:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    def test_defs_참조로_검증(self):
+        self.assertEqual(self.raw("POST", "/v1/purge", json.dumps({"drafts_removed": 1, "sources_removed": 0}).encode())[0], 200)
+        self.assertEqual(self.raw("POST", "/v1/purge", json.dumps({"drafts_removed": -1, "sources_removed": 0}).encode())[0], 400)
+
+    def test_호출자_ID와_퍼센트_인코딩_보존(self):
+        c, _, b = self.raw("GET", "/v1/files/a%2Fb.jsonl")
+        self.assertEqual((c, json.loads(b)), (200, {"path": "a/b.jsonl", "actor": "svc-a"}))
+
+    def test_스트리밍(self):
+        c, _, b = self.raw("GET", "/v1/stream")
+        self.assertEqual((c, len(b)), (200, 4096))
+
+    def test_405에_Allow(self):
+        c, h, _ = self.raw("DELETE", "/v1/stream")
+        self.assertEqual((c, h.get("Allow")), (405, "GET"))
