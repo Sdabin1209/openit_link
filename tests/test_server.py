@@ -255,3 +255,18 @@ class V040(unittest.TestCase):
         self.raw("POST", b"{}", {"Authorization": "Bearer op-token-0123456789", "X-Openit-User": "kim", "Content-Type": "application/json"})
         got = [(x["status"], x["code"], x["actor"], x["user"]) for x in self.seen]
         self.assertEqual(got, [(401, "PERMISSION_DENIED", "svc", None), (201, None, "svc", "kim")])
+
+
+class V041(unittest.TestCase):
+    """0.4.1: Request.content_length와 머리글의 content-length·content-type."""
+    def test_content_length(self):
+        import io
+        seen = {}
+        def h(r):
+            seen.update(cl=r.content_length, hl=r.headers.get("content-length"), ct=r.headers.get("content-type"))
+            return Response(200, {"ok": True})
+        app = App([Route("PUT", "/v1/x", h, roles=frozenset({"op"}), stream_body=True)], {"t-0123456789": "op"})
+        env = {"REQUEST_METHOD": "PUT", "PATH_INFO": "/v1/x", "CONTENT_LENGTH": "5", "CONTENT_TYPE": "application/x-tar",
+               "HTTP_AUTHORIZATION": "Bearer t-0123456789", "wsgi.input": io.BytesIO(b"abcde")}
+        status, _, _ = app.handle(env)
+        self.assertEqual((status, seen), (200, {"cl": 5, "hl": "5", "ct": "application/x-tar"}))

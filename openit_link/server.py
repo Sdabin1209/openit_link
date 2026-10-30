@@ -40,6 +40,7 @@ class Request:
     headers: Mapping[str, str]
     actor: Optional[str] = None            # 0.2.0: 토큰에 묶인 호출자 ID(토큰 표의 값이 {"role", "actor"}일 때)
     stream: Any = None                     # 0.3.0: Route.stream_body일 때 본문 읽기 객체(read(n), Content-Length 상한)
+    content_length: Optional[int] = None   # 0.4.1: 요청의 Content-Length(없으면 None). 스트리밍 본문의 크기를 미리 판단할 때 쓴다
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,7 @@ class App:
                 _validate(route.request_schema, body)
             if route.query_schema is not None:
                 _validate(route.query_schema, query)
-            req = Request(method, path, params, query, body, raw, role, user, _headers(environ), actor, stream)
+            req = Request(method, path, params, query, body, raw, role, user, _headers(environ), actor, stream, _content_length(environ))
             resp = route.handler(req)
             if route.response_schema is not None and 200 <= resp.status < 300 and isinstance(resp.body, (dict, list)):
                 errs = _errors(route.response_schema, resp.body)
@@ -370,4 +371,16 @@ def _query(environ) -> dict:
 
 
 def _headers(environ) -> dict:
-    return {k[5:].replace("_", "-").lower(): v for k, v in environ.items() if k.startswith("HTTP_") and k != "HTTP_AUTHORIZATION"}
+    """요청 머리글(소문자). WSGI는 Content-Length·Content-Type을 HTTP_ 접두사 없이 주므로 함께 담는다(0.4.1, PEP 3333). Authorization은 넣지 않는다(비밀)."""
+    h = {k[5:].replace("_", "-").lower(): v for k, v in environ.items() if k.startswith("HTTP_") and k != "HTTP_AUTHORIZATION"}
+    for k, name in (("CONTENT_LENGTH", "content-length"), ("CONTENT_TYPE", "content-type")):
+        if environ.get(k):
+            h[name] = environ[k]
+    return h
+
+
+def _content_length(environ) -> Optional[int]:
+    try:
+        return int(environ["CONTENT_LENGTH"]) if environ.get("CONTENT_LENGTH") else None
+    except ValueError:
+        return None
