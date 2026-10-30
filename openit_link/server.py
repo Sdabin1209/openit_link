@@ -39,6 +39,7 @@ class Request:
     user: Optional[str]
     headers: Mapping[str, str]
     actor: Optional[str] = None            # 0.2.0: 토큰에 묶인 호출자 ID(토큰 표의 값이 {"role", "actor"}일 때)
+    stream: Any = None                     # 0.3.0: Route.stream_body일 때 본문 읽기 객체(read(n), Content-Length 상한)
 
 
 @dataclass(frozen=True)
@@ -60,11 +61,20 @@ class Route:
     response_schema: Optional[str] = None  # 2xx JSON 본문을 이것으로 검증한다(내는 쪽 검증)
     require_user: bool = False             # 사람 행위자(X-Openit-User)가 필요한 쓰기
     raw_body: bool = False                 # JSON이 아닌 본문(tar 등)을 그대로 넘긴다
+    stream_body: bool = False              # 0.3.0: 본문을 메모리에 올리지 않고 Request.stream(상한 걸린 읽기 객체)으로 넘긴다(수 GiB 게시)
     max_body: int = DEFAULT_MAX_BODY
 
     def compiled(self):
         rx = "^" + re.sub(r"\\\{(\w+)\\\}", r"(?P<\1>[^/]+)", re.escape(self.pattern)) + "$"
         return re.compile(rx)
+
+
+class HttpError(Exception):
+    """0.3.0: BoundaryError에 응답 머리글(예: Retry-After)을 붙여 낸다. 처리 함수가 `raise HttpError(BoundaryError(...), {"Retry-After": "2"})`."""
+
+    def __init__(self, error: BoundaryError, headers: Optional[Mapping[str, str]] = None):
+        super().__init__(error.message)
+        self.error, self.headers = error, dict(headers or {})
 
 
 def _unauth(message: str) -> BoundaryError:
@@ -75,12 +85,19 @@ class App:
     """WSGI 앱. tokens: 토큰 문자열 → 역할 이름(비밀은 파일에서 읽어 넘긴다, D84). ready: /readyz 판정 함수 → (준비됨, 본문 dict)."""
 
     def __init__(self, routes: list[Route], tokens: Mapping[str, str], *, ready: Optional[Callable[[], tuple]] = None,
-                 user_header_trusted: bool = True):
+                 user_header_trusted: bool = True, authenticate: Optional[Callable[[Mapping[str, str]], Optional[tuple]]] = None,
+                 ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = 64):
+        """authenticate(0.3.0): 토큰이 없을 때 부르는 추가 인증(예: 게이트웨이가 확인한 X-Openit-Device를 믿는 내부망 경로, ADR 0012).
+        요청 머리글(소문자 이름) → (역할, 호출자 ID) 또는 None. ready_public(0.3.0): 인증되지 않은 /readyz 호출에 줄 본문(사유를 감춘다);
+        인증된 호출(토큰 표의 토큰)에는 ready()의 본문 전체를 준다. max_json_depth(0.3.0): JSON 중첩 상한(넘으면 400, 재귀 한도로 죽지 않게)."""
         self._routes = [(r, r.compiled()) for r in routes]
         # 토큰 표: 토큰 → 역할 문자열, 또는 {"role": 역할, "actor": 호출자 ID}(0.2.0). 비교는 상수 시간(hmac.compare_digest)으로 모든 후보를 끝까지 본다
         self._tokens = [(t.encode(), (v["role"], v.get("actor")) if isinstance(v, Mapping) else (v, None)) for t, v in tokens.items()]
         self._ready = ready
         self._user_trusted = user_header_trusted   # 게이트웨이 뒤 내부망에서만 X-Openit-User를 믿는다(게이트웨이가 덮어쓴다, D88)
+        self._authenticate = authenticate
+        self._ready_public = ready_public
+        self._max_depth = max_json_depth
 
     # ---- WSGI ----
     def __call__(self, environ, start_response):
@@ -97,25 +114,29 @@ class App:
                 return self._json(200, {"status": "ok"})
             if path == "/readyz" and method == "GET":
                 ok, info = self._ready() if self._ready else (True, {"status": "ready"})
+                if self._ready_public is not None and self._principal(environ) is None:
+                    info = self._ready_public(info)
                 return self._json(200 if ok else 503, info)
             route, params = self._match(method, raw_path or path, encoded=bool(raw_path))
-            raw = self._read(environ, route.max_body)   # 전송 한도(413)는 앱 판단보다 먼저다(CONVENTIONS 9절 2.2.2: HTTP 서버가 앱을 부르기 전에 낸다)
+            if route.stream_body:
+                stream = self._stream(environ, route.max_body)
+                raw = b""
+            else:
+                stream = None
+                raw = self._read(environ, route.max_body)   # 전송 한도(413)는 앱 판단보다 먼저다(CONVENTIONS 9절 2.2.2: HTTP 서버가 앱을 부르기 전에 낸다)
             role, actor = self._auth(route, environ)
             user = environ.get("HTTP_X_OPENIT_USER") if self._user_trusted else None
             if route.require_user and not user:
                 raise _unauth("사람 행위자(X-Openit-User)가 없다")
             body = None
             if raw and not route.raw_body:
-                try:
-                    body = json.loads(raw)
-                except ValueError:
-                    raise BoundaryError("INVALID_RECORD", "본문이 JSON이 아니다") from None
+                body = _strict_json(raw, self._max_depth)
             query = _query(environ)
             if route.request_schema is not None:
                 _validate(route.request_schema, body)
             if route.query_schema is not None:
                 _validate(route.query_schema, query)
-            req = Request(method, path, params, query, body, raw, role, user, _headers(environ), actor)
+            req = Request(method, path, params, query, body, raw, role, user, _headers(environ), actor, stream)
             resp = route.handler(req)
             if route.response_schema is not None and 200 <= resp.status < 300 and isinstance(resp.body, (dict, list)):
                 errs = _errors(route.response_schema, resp.body)
@@ -124,6 +145,10 @@ class App:
             return self._out(resp)
         except BoundaryError as e:
             return self._error(e)
+        except HttpError as e:
+            st, headers, data = self._error(e.error)
+            headers.update(e.headers)
+            return st, headers, data
         except _HttpOnly as e:
             return e.status, {"Content-Type": "application/json", **e.headers}, json.dumps({"message": e.message}, ensure_ascii=False).encode()
 
@@ -144,18 +169,34 @@ class App:
     def _auth(self, route: Route, environ) -> tuple:
         if not route.roles:
             return None, None
-        auth = environ.get("HTTP_AUTHORIZATION", "")
-        given = auth[7:].encode() if auth.startswith("Bearer ") else b""
-        found = None
-        for tok, principal in self._tokens:   # 일치해도 멈추지 않는다: 어느 후보와 맞았는지가 시간에 드러나지 않게(타이밍 공격 방어)
-            if hmac.compare_digest(given, tok) and given:
-                found = principal
+        found = self._principal(environ)
+        if found is None and self._authenticate is not None and not environ.get("HTTP_AUTHORIZATION"):
+            found = self._authenticate(_headers(environ))
         if found is None:
             raise _unauth("토큰이 없거나 틀리다")
         role, actor = found
         if role not in route.roles:
             raise BoundaryError("PERMISSION_DENIED", "이 호출을 할 권한이 없다")
         return role, actor
+
+    def _principal(self, environ) -> Optional[tuple]:
+        auth = environ.get("HTTP_AUTHORIZATION", "")
+        given = auth[7:].encode() if auth.startswith("Bearer ") else b""
+        found = None
+        for tok, principal in self._tokens:   # 일치해도 멈추지 않는다: 어느 후보와 맞았는지가 시간에 드러나지 않게(타이밍 공격 방어)
+            if hmac.compare_digest(given, tok) and given:
+                found = principal
+        return found
+
+    @staticmethod
+    def _stream(environ, limit: int):
+        try:
+            n = int(environ.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            raise BoundaryError("INVALID_RECORD", "Content-Length가 잘못됐다") from None
+        if n > limit:
+            raise _HttpOnly(413, f"본문이 상한({limit}바이트)을 넘는다")
+        return _Limited(environ["wsgi.input"], n)
 
     @staticmethod
     def _read(environ, limit: int) -> bytes:
@@ -200,6 +241,77 @@ class _HttpOnly(Exception):
     def __init__(self, status: int, message: str, headers: Optional[dict] = None):
         super().__init__(message)
         self.status, self.message, self.headers = status, message, headers or {}
+
+
+class _Limited:
+    """Content-Length만큼만 읽게 하는 본문 읽기 객체(0.3.0). 상한을 넘겨 읽지 않는다."""
+
+    def __init__(self, f, n: int):
+        self._f, self.remaining = f, n
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        size = self.remaining if size is None or size < 0 else min(size, self.remaining)
+        data = self._f.read(size)
+        self.remaining -= len(data)
+        return data
+
+
+def _no_dup(pairs):
+    seen = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"중복 키 {k!r}")
+        seen[k] = v
+    return seen
+
+
+def _depth(o, limit: int, d: int = 0) -> None:
+    if d > limit:
+        raise ValueError("중첩이 너무 깊다")
+    if isinstance(o, dict):
+        for v in o.values():
+            _depth(v, limit, d + 1)
+    elif isinstance(o, list):
+        for v in o:
+            _depth(v, limit, d + 1)
+
+
+def _strict_json(raw: bytes, max_depth: int):
+    """0.3.0: I-JSON(RFC 7493)에 맞춰 받는다 — UTF-8, 중복 키 거부, 짝 없는 서로게이트 거부, 중첩 상한. 어기면 400 INVALID_RECORD."""
+    try:
+        text = raw.decode("utf-8")
+        if raw.count(b"[") + raw.count(b"{") > max_depth and _bracket_depth(text) > max_depth:
+            raise ValueError("중첩이 너무 깊다")
+        obj = json.loads(text, object_pairs_hook=_no_dup)
+        json.dumps(obj, ensure_ascii=False).encode("utf-8")   # 짝 없는 서로게이트는 여기서 UnicodeEncodeError
+        _depth(obj, max_depth)
+        return obj
+    except (ValueError, UnicodeError, RecursionError) as e:
+        raise BoundaryError("INVALID_RECORD", f"본문이 올바른 JSON이 아니다: {str(e)[:120]}") from None
+
+
+def _bracket_depth(text: str) -> int:
+    """문자열 밖의 괄호 깊이(재귀 없이). json.loads가 깊은 중첩에서 RecursionError로 죽기 전에 거른다."""
+    d = m = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            d += 1
+            m = max(m, d)
+        elif ch in "]}":
+            d -= 1
+    return m
 
 
 def _resolve(ref: str):

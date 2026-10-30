@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 import waitress
-from boundary_contracts import validator
+from boundary_contracts import BoundaryError, validator
 
 from openit_link import App, Response, Route
 
@@ -145,3 +145,74 @@ class V020(unittest.TestCase):
     def test_405에_Allow(self):
         c, h, _ = self.raw("DELETE", "/v1/stream")
         self.assertEqual((c, h.get("Allow")), (405, "GET"))
+
+
+class V030(unittest.TestCase):
+    """0.3.0: 본문 스트리밍, 기기 머리글 추가 인증, 오류 머리글, 엄격한 JSON(I-JSON), /readyz 사유 감추기."""
+    @classmethod
+    def setUpClass(cls):
+        def upload(req):
+            n = 0
+            while True:
+                chunk = req.stream.read(65536)
+                if not chunk:
+                    break
+                n += len(chunk)
+            return Response(200, {"bytes": n})
+
+        def busy(req):
+            from openit_link import HttpError
+            raise HttpError(BoundaryError("UNAVAILABLE", "잠시 뒤에"), {"Retry-After": "2"})
+
+        dev = lambda h: ("kiosk", h["x-openit-device"]) if h.get("x-openit-device") else None
+        routes = [Route("PUT", "/v1/blob", upload, roles=frozenset({"operator"}), stream_body=True, max_body=8 * 2**20),
+                  Route("GET", "/v1/busy", busy, roles=frozenset({"operator"})),
+                  Route("POST", "/v1/echo", lambda r: Response(200, {"ok": True}), roles=frozenset({"operator"})),
+                  Route("GET", "/v1/me", lambda r: Response(200, {"role": r.role, "actor": r.actor}), roles=frozenset({"kiosk"}))]
+        cls.app = App(routes, {"op-token-0123456789": "operator"}, authenticate=dev,
+                      ready=lambda: (False, {"status": "not-ready", "db": "secret-host:5432"}),
+                      ready_public=lambda info: {"status": info["status"]})
+        cls.srv = waitress.create_server(cls.app, host="127.0.0.1", port=0)
+        cls.port = cls.srv.effective_port
+        threading.Thread(target=cls.srv.run, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.close()
+
+    def raw(self, method, path, data=None, headers=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method, data=data)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
+    OP = {"Authorization": "Bearer op-token-0123456789"}
+
+    def test_본문_스트리밍(self):
+        c, _, b = self.raw("PUT", "/v1/blob", b"z" * (3 * 2**20), self.OP)
+        self.assertEqual((c, json.loads(b)), (200, {"bytes": 3 * 2**20}))
+
+    def test_기기_머리글_인증(self):
+        c, _, b = self.raw("GET", "/v1/me", headers={"X-Openit-Device": "kiosk-01"})
+        self.assertEqual((c, json.loads(b)), (200, {"role": "kiosk", "actor": "kiosk-01"}))
+        self.assertEqual(self.raw("GET", "/v1/me")[0], 401)
+
+    def test_오류에_Retry_After(self):
+        c, h, b = self.raw("GET", "/v1/busy", headers=self.OP)
+        self.assertEqual((c, h.get("Retry-After"), json.loads(b)["code"]), (503, "2", "UNAVAILABLE"))
+
+    def test_엄격한_JSON(self):
+        H = {**self.OP, "Content-Type": "application/json"}
+        self.assertEqual(self.raw("POST", "/v1/echo", b'{"a":1,"a":2}', H)[0], 400)
+        self.assertEqual(self.raw("POST", "/v1/echo", b'{"a":"\\ud800"}', H)[0], 400)
+        self.assertEqual(self.raw("POST", "/v1/echo", b"[" * 5000 + b"]" * 5000, H)[0], 400)
+        self.assertEqual(self.raw("POST", "/v1/echo", b'{"a":"\\ud83d\\ude00"}', H)[0], 200)
+
+    def test_readyz_사유는_인증된_호출에만(self):
+        c, _, b = self.raw("GET", "/readyz")
+        self.assertEqual((c, json.loads(b)), (503, {"status": "not-ready"}))
+        self.assertEqual(json.loads(self.raw("GET", "/readyz", headers=self.OP)[2])["db"], "secret-host:5432")
