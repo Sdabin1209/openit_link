@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
@@ -23,6 +24,7 @@ STATUS = {"INVALID_RECORD": 400, "PERMISSION_DENIED": 403, "NOT_FOUND": 404, "CO
 REASON = {200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 400: "Bad Request", 401: "Unauthorized",
           403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 412: "Precondition Failed",
           413: "Content Too Large", 422: "Unprocessable Content", 503: "Service Unavailable"}
+_log = logging.getLogger("openit_link")
 DEFAULT_MAX_BODY = 1 * 2**20   # 1 MiB: 계약 요청 본문(레코드 하나)의 상한. 측정값이 아니라 판단이다. 큰 본문(패키지 tar)을 받는 경로는 Route.max_body로 늘린다
 
 
@@ -178,6 +180,9 @@ class App:
             st, headers, data = self._error(BoundaryError("INVALID_RECORD", e.message, {"http_status": e.status}))
             headers.update(e.headers)
             return st, headers, data
+        except Exception:   # noqa: BLE001 — 0.4.2: 처리 함수의 예기치 않은 예외도 BoundaryError 레코드로 낸다(CONVENTIONS 9절 "실패는 BoundaryError 레코드"). 서버 결함이라 503 UNAVAILABLE, 예외 내용은 응답에 싣지 않고 로그에만(값·비밀이 새지 않게)
+            _log.exception("처리 중 예기치 않은 예외 (%s %s)", method, ctx.get("pattern", path))
+            return self._error(BoundaryError("UNAVAILABLE", "서버 내부 오류"))
 
     # ---- 내부 ----
     def _match(self, method: str, path: str, encoded: bool = False):
@@ -221,6 +226,8 @@ class App:
             n = int(environ.get("CONTENT_LENGTH") or 0)
         except ValueError:
             raise BoundaryError("INVALID_RECORD", "Content-Length가 잘못됐다") from None
+        if n < 0:   # 0.4.2: 음수면 상한 검사를 지나쳐 read(-n)이 본문 전체를 한도 없이 읽는다(RFC 9110 8.6: 0 이상의 정수)
+            raise BoundaryError("INVALID_RECORD", "Content-Length가 잘못됐다")
         if n > limit:
             raise _HttpOnly(413, f"본문이 상한({limit}바이트)을 넘는다")
         return _Limited(environ["wsgi.input"], n)
@@ -231,6 +238,8 @@ class App:
             n = int(environ.get("CONTENT_LENGTH") or 0)
         except ValueError:
             raise BoundaryError("INVALID_RECORD", "Content-Length가 잘못됐다") from None
+        if n < 0:   # 0.4.2: 음수면 상한 검사를 지나쳐 read(-n)이 본문 전체를 한도 없이 읽는다(RFC 9110 8.6: 0 이상의 정수)
+            raise BoundaryError("INVALID_RECORD", "Content-Length가 잘못됐다")
         if n > limit:
             raise _HttpOnly(413, f"본문이 상한({limit}바이트)을 넘는다")
         return environ["wsgi.input"].read(n) if n else b""
@@ -381,6 +390,7 @@ def _headers(environ) -> dict:
 
 def _content_length(environ) -> Optional[int]:
     try:
-        return int(environ["CONTENT_LENGTH"]) if environ.get("CONTENT_LENGTH") else None
+        n = int(environ["CONTENT_LENGTH"]) if environ.get("CONTENT_LENGTH") else None
+        return n if n is None or n >= 0 else None
     except ValueError:
         return None

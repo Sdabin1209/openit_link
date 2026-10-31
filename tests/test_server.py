@@ -270,3 +270,29 @@ class V041(unittest.TestCase):
                "HTTP_AUTHORIZATION": "Bearer t-0123456789", "wsgi.input": io.BytesIO(b"abcde")}
         status, _, _ = app.handle(env)
         self.assertEqual((status, seen), (200, {"cl": 5, "hl": "5", "ct": "application/x-tar"}))
+
+
+def test_negative_content_length_is_rejected_without_reading_the_body():
+    """0.4.2: 음수 Content-Length는 상한 검사를 지나쳐 본문 전체를 읽게 했다(RFC 9110 8.6). 400 INVALID_RECORD로 거부하고 본문은 읽지 않는다."""
+    import io
+    reads = []
+
+    class Body(io.BytesIO):
+        def read(self, n=-1):
+            reads.append(n)
+            return super().read(n)
+
+    app = App([Route("POST", "/v1/x", lambda q: Response(200, {"ok": True}))], {})
+    st, _, data = app.handle({"REQUEST_METHOD": "POST", "PATH_INFO": "/v1/x", "CONTENT_LENGTH": "-5", "wsgi.input": Body(b"x" * 100)})
+    assert st == 400 and json.loads(data)["code"] == "INVALID_RECORD" and reads == []
+
+
+def test_unexpected_handler_exception_is_a_boundary_error_503_without_details():
+    """0.4.2: 처리 함수의 예기치 않은 예외도 BoundaryError 레코드(503 UNAVAILABLE)로 낸다. 예외 내용(값·비밀)은 응답에 싣지 않는다."""
+    def boom(q):
+        raise RuntimeError("secret-value-123")
+
+    app = App([Route("GET", "/v1/x", boom)], {})
+    st, _, data = app.handle({"REQUEST_METHOD": "GET", "PATH_INFO": "/v1/x"})
+    rec = json.loads(data)
+    assert st == 503 and rec["code"] == "UNAVAILABLE" and rec["retryable"] is True and b"secret-value-123" not in data
