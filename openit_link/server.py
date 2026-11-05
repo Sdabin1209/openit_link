@@ -136,7 +136,8 @@ class App:
                     value = None if status == 204 and data == b"" else data
                 template = ctx.get("pattern")
                 method = environ.get("REQUEST_METHOD", "GET").upper()
-                if template is None and environ.get("PATH_INFO") in ("/healthz", "/readyz"):
+                # 상태 확인 경로의 응답 계약은 GET 에만 있다. 다른 메서드(405 등)는 일반 오류 계약으로 본다(POST /healthz 가 503 이 되던 결함, 2026-11-06)
+                if template is None and method == "GET" and environ.get("PATH_INFO") in ("/healthz", "/readyz"):
                     template = environ["PATH_INFO"]
                 if template:
                     self._contract.response(method, template, status, value, content_type=ct, headers=headers)
