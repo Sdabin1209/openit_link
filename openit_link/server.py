@@ -90,10 +90,16 @@ class App:
     def __init__(self, routes: list[Route], tokens: Mapping[str, str], *, ready: Optional[Callable[[], tuple]] = None,
                  user_header_trusted: bool = True, authenticate: Optional[Callable[[Mapping[str, str]], Optional[tuple]]] = None,
                  ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = 64,
-                 on_result: Optional[Callable[[dict], None]] = None):
+                 on_result: Optional[Callable[[dict], None]] = None,
+                 contract_service: Optional[str] = None, contract_bindings: Optional[Mapping] = None):
         """authenticate(0.3.0): 토큰이 없을 때 부르는 추가 인증(예: 게이트웨이가 확인한 X-Openit-Device를 믿는 내부망 경로, ADR 0012).
         요청 머리글(소문자 이름) → (역할, 호출자 ID) 또는 None. ready_public(0.3.0): 인증되지 않은 /readyz 호출에 줄 본문(사유를 감춘다);
         인증된 호출(토큰 표의 토큰)에는 ready()의 본문 전체를 준다. max_json_depth(0.3.0): JSON 중첩 상한(넘으면 400, 재귀 한도로 죽지 않게)."""
+        from boundary_contracts.http_contracts import HttpContract
+        self._contract = HttpContract(contract_service, bindings=dict(contract_bindings or {})) if contract_service else None
+        if self._contract:
+            for route in routes:
+                self._contract.verify_route(route.method, route.pattern, route.roles, route.max_body)
         self._routes = [(r, r.compiled()) for r in routes]
         # 토큰 표: 토큰 → 역할 문자열, 또는 {"role": 역할, "actor": 호출자 ID}(0.2.0). 비교는 상수 시간(hmac.compare_digest)으로 모든 후보를 끝까지 본다
         self._tokens = [(t.encode(), (v["role"], v.get("actor")) if isinstance(v, Mapping) else (v, None)) for t, v in tokens.items()]
@@ -115,6 +121,30 @@ class App:
     def handle(self, environ) -> tuple:
         ctx: dict = {}   # 요청마다 따로(waitress는 여러 스레드에서 동시에 부른다)
         out = self._handle(environ, ctx)
+        if self._contract:
+            # Validate at the final producer boundary, including generated errors,
+            # actual Content-Type and headers. No branch bypasses this check.
+            from boundary_contracts.http_contracts import ContractViolation
+            status, headers, data = out
+            ct = headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+            try:
+                if ct == "application/json":
+                    value = json.loads(data)
+                elif ct.startswith("text/") and ct != "text/event-stream" and isinstance(data, bytes):
+                    value = data.decode("utf-8")
+                else:
+                    value = None if status == 204 and data == b"" else data
+                template = ctx.get("pattern")
+                method = environ.get("REQUEST_METHOD", "GET").upper()
+                if template is None and environ.get("PATH_INFO") in ("/healthz", "/readyz"):
+                    template = environ["PATH_INFO"]
+                if template:
+                    self._contract.response(method, template, status, value, content_type=ct, headers=headers)
+                elif status >= 400:
+                    self._contract.check({"$ref": "../schemas/HttpErrors.schema.json#/$defs/" + str(status)}, value, "error")
+            except Exception as error:
+                _log.error("outgoing HTTP contract violation: %s", type(error).__name__)
+                out = self._error(BoundaryError("UNAVAILABLE", "outgoing HTTP contract violation"))
         if self._on_result is not None and ctx:
             try:
                 code = None
@@ -133,6 +163,16 @@ class App:
         path = environ.get("PATH_INFO", "/")
         raw_path = (environ.get("REQUEST_URI") or environ.get("RAW_URI") or "").split("?", 1)[0]   # 0.2.0: %2F를 보존한 원래 경로(waitress·gunicorn이 준다)
         try:
+            if self._contract and path in ("/healthz", "/readyz") and method == "GET":
+                from boundary_contracts.http_contracts import ContractViolation
+                ctx.update({"method": method, "pattern": path, "params": {}})
+                operation = self._contract.operation(method, path)
+                raw = self._read(environ, self._contract.bound(operation["x-max-body-bytes"]))
+                try:
+                    self._contract.request(method, path, params={}, query=_query(environ),
+                                           headers=_headers(environ), body=None, raw=raw)
+                except ContractViolation as error:
+                    raise BoundaryError("INVALID_RECORD", str(error)) from None
             if path == "/healthz" and method == "GET":
                 return self._json(200, {"status": "ok"})
             if path == "/readyz" and method == "GET":
@@ -159,13 +199,25 @@ class App:
             if raw and not route.raw_body:
                 body = _strict_json(raw, self._max_depth)
             query = _query(environ)
-            if route.request_schema is not None:
-                _validate(route.request_schema, body)
-            if route.query_schema is not None:
-                _validate(route.query_schema, query)
+            if self._contract:
+                from boundary_contracts.http_contracts import ContractViolation, AuthenticationRequired, AuthorizationDenied
+                try:
+                    self._contract.request(method, route.pattern, params=params, query=query,
+                                           headers=_headers(environ), body=body, raw=raw, streaming=route.stream_body, role=role)
+                except AuthorizationDenied:
+                    raise BoundaryError("PERMISSION_DENIED", "role claim conflicts with authenticated role") from None
+                except AuthenticationRequired:
+                    raise _unauth("authenticated actor is required") from None
+                except ContractViolation as error:
+                    raise BoundaryError("INVALID_RECORD", str(error)) from None
+            else:
+                if route.request_schema is not None:
+                    _validate(route.request_schema, body)
+                if route.query_schema is not None:
+                    _validate(route.query_schema, query)
             req = Request(method, path, params, query, body, raw, role, user, _headers(environ), actor, stream, _content_length(environ))
             resp = route.handler(req)
-            if route.response_schema is not None and 200 <= resp.status < 300 and isinstance(resp.body, (dict, list)):
+            if not self._contract and route.response_schema is not None and 200 <= resp.status < 300 and isinstance(resp.body, (dict, list)):
                 errs = _errors(route.response_schema, resp.body)
                 if errs:   # 내는 쪽이 계약을 어기면 받는 쪽에 틀린 값을 보내지 않는다: 서버 결함
                     raise BoundaryError("UNAVAILABLE", f"응답이 {route.response_schema}를 어긴다(서버 결함)")
@@ -199,7 +251,11 @@ class App:
         raise BoundaryError("NOT_FOUND", "경로가 없다")
 
     def _auth(self, route: Route, environ) -> tuple:
-        if not route.roles:
+        required = False
+        if self._contract:
+            operation = self._contract.operation(route.method, route.pattern)
+            required = bool(operation.get("security", self._contract.doc["security"])) and not self._contract.bound(operation.get("x-allow-anonymous", False))
+        if not route.roles and not required:
             return None, None
         found = self._principal(environ)
         if found is None and self._authenticate is not None and not environ.get("HTTP_AUTHORIZATION"):
@@ -361,7 +417,7 @@ def _resolve(ref: str):
         sub = sub[k]
     wrapped = {**{k: v for k, v in top.items() if k in ("$schema", "$id", "$defs")}, "$ref": "#" + frag}
     base = validator(name)
-    return type(base)(wrapped, resolver=getattr(base, "resolver", None)) if getattr(base, "resolver", None) else type(base)(wrapped)
+    return base.evolve(schema={**wrapped, "$id": base.schema["$id"]})
 
 
 def _errors(ref: str, value) -> list:
@@ -376,7 +432,10 @@ def _validate(ref: str, value) -> None:
 
 def _query(environ) -> dict:
     from urllib.parse import parse_qs
-    return {k: v[-1] for k, v in parse_qs(environ.get("QUERY_STRING", "")).items()}
+    values = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    if any(len(v) != 1 for v in values.values()):
+        raise BoundaryError("INVALID_RECORD", "query: repeated keys")
+    return {k: v[0] for k, v in values.items()}
 
 
 def _headers(environ) -> dict:

@@ -17,3 +17,6 @@
 
 ## 5. 시험 상태
 커밋 메시지에 새 clone + 새 venv 결과를 적는다.
+
+선언된 서비스 HTTP 계약의 연결과 검증은 [ADR 0002](docs/adr/0002-선언된-HTTP-계약을-검증한다.md)를 따른다.
+`contract_service`와 `contract_bindings`를 wiring에서 제공하며, 계약과 다른 역할·본문 한도는 시작 시 거부한다.
