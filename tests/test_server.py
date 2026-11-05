@@ -31,6 +31,8 @@ class Server(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # 일꾼 스레드를 먼저 멈춘다: 닫은 깨우기 파이프 fd 가 재사용된 뒤 늦은 b"x" 가 다른 출력에 끼어들지 않게(waitress trigger, model-runtime 98bed20 과 같은 경합)
+        cls.srv.task_dispatcher.shutdown(cancel_pending=True, timeout=5)
         cls.srv.close()
 
     def call(self, method, path, body=None, token=None, user=None):
@@ -117,6 +119,8 @@ class V020(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # 일꾼 스레드를 먼저 멈춘다: 닫은 깨우기 파이프 fd 가 재사용된 뒤 늦은 b"x" 가 다른 출력에 끼어들지 않게(waitress trigger, model-runtime 98bed20 과 같은 경합)
+        cls.srv.task_dispatcher.shutdown(cancel_pending=True, timeout=5)
         cls.srv.close()
 
     def raw(self, method, path, data=None):
@@ -178,6 +182,8 @@ class V030(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # 일꾼 스레드를 먼저 멈춘다: 닫은 깨우기 파이프 fd 가 재사용된 뒤 늦은 b"x" 가 다른 출력에 끼어들지 않게(waitress trigger, model-runtime 98bed20 과 같은 경합)
+        cls.srv.task_dispatcher.shutdown(cancel_pending=True, timeout=5)
         cls.srv.close()
 
     def raw(self, method, path, data=None, headers=None):
@@ -231,6 +237,8 @@ class V040(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # 일꾼 스레드를 먼저 멈춘다: 닫은 깨우기 파이프 fd 가 재사용된 뒤 늦은 b"x" 가 다른 출력에 끼어들지 않게(waitress trigger, model-runtime 98bed20 과 같은 경합)
+        cls.srv.task_dispatcher.shutdown(cancel_pending=True, timeout=5)
         cls.srv.close()
 
     def raw(self, method, data=b"", headers=None):
