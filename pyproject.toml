@@ -6,8 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "openit-link"
 version = "0.5.0"
 requires-python = ">=3.10"
-description = "영역 통신 기반(D118): 받는 쪽 WSGI 서버 기반과 계약 클라이언트 재수출. 계약은 boundary-contracts v4.0.0-rc1에 고정."
-dependencies = ["boundary-contracts @ git+ssh://git@github.com/Sdabin1209/openit_boundary-contracts.git@v4.0.0-rc1"]
+description = "영역 통신 기반(D118): 받는 쪽 WSGI 서버 기반과 계약 클라이언트 재수출. 계약은 boundary-contracts v4.0.0에 고정."
+dependencies = ["boundary-contracts @ git+ssh://git@github.com/Sdabin1209/openit_boundary-contracts.git@v4.0.0"]
 
 [tool.setuptools]
 packages = ["openit_link"]
