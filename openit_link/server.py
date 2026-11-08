@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 from boundary_contracts import PIPELINE_SCHEMA_VERSION, BoundaryError, load_schema, validator
-import jsonschema
 
 # CONVENTIONS 9절의 고정 표. 401은 PERMISSION_DENIED + details.http_status 401로 낸다(D106).
 STATUS = {"INVALID_RECORD": 400, "PERMISSION_DENIED": 403, "NOT_FOUND": 404, "CONFLICT": 409,
@@ -124,7 +123,6 @@ class App:
         if self._contract:
             # Validate at the final producer boundary, including generated errors,
             # actual Content-Type and headers. No branch bypasses this check.
-            from boundary_contracts.http_contracts import ContractViolation
             status, headers, data = out
             ct = headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
             try:
