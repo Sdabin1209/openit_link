@@ -12,6 +12,9 @@ import hmac
 import json
 import logging
 import re
+import traceback
+import sys
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
@@ -24,6 +27,7 @@ REASON = {200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 400: "B
           403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 412: "Precondition Failed",
           413: "Content Too Large", 422: "Unprocessable Content", 503: "Service Unavailable"}
 _log = logging.getLogger("openit_link")
+_FIXED_503 = json.dumps(BoundaryError("UNAVAILABLE", "서버 내부 오류").to_record(PIPELINE_SCHEMA_VERSION), ensure_ascii=False).encode()   # 0.6.1: 오류 본문 복구용 상수(입력 값 없음)
 DEFAULT_MAX_BODY = 1 * 2**20   # 1 MiB: 계약 요청 본문(레코드 하나)의 상한. 측정값이 아니라 판단이다. 큰 본문(패키지 tar)을 받는 경로는 Route.max_body로 늘린다
 
 
@@ -232,7 +236,11 @@ class App:
             headers.update(e.headers)
             return st, headers, data
         except Exception:   # noqa: BLE001 — 0.4.2: 처리 함수의 예기치 않은 예외도 BoundaryError 레코드로 낸다(CONVENTIONS 9절 "실패는 BoundaryError 레코드"). 서버 결함이라 503 UNAVAILABLE, 예외 내용은 응답에 싣지 않고 로그에만(값·비밀이 새지 않게)
-            _log.exception("처리 중 예기치 않은 예외 (%s %s)", method, ctx.get("pattern", path))
+            # 0.6.1(RUNTIME R8.1): 예외 메시지·traceback 은 값(환자 문장·비밀)을 담을 수 있다. 예외 종류와 발생 위치(파일:줄)만 남긴다
+            _exc = sys.exc_info()[1]
+            _tb = traceback.extract_tb(_exc.__traceback__)[-1:] if _exc is not None else []
+            _where = f"{os.path.basename(_tb[0].filename)}:{_tb[0].lineno}" if _tb else "?"
+            _log.error("처리 중 예기치 않은 예외 (%s %s) %s at %s", method, ctx.get("pattern", path), type(_exc).__name__, _where)
             return self._error(BoundaryError("UNAVAILABLE", "서버 내부 오류"))
 
     # ---- 내부 ----
@@ -323,10 +331,14 @@ class App:
         return status, headers, data
 
     def _error(self, e: BoundaryError) -> tuple:
-        status = (e.details or {}).get("http_status") or STATUS[e.code]
-        details = {k: v for k, v in (e.details or {}).items() if k != "http_status"}
-        rec = BoundaryError(e.code, e.message, details or None).to_record(PIPELINE_SCHEMA_VERSION)
-        st, headers, data = self._json(status, rec)
+        try:
+            status = (e.details or {}).get("http_status") or STATUS[e.code]
+            details = {k: v for k, v in (e.details or {}).items() if k != "http_status"}
+            rec = BoundaryError(e.code, e.message, details or None).to_record(PIPELINE_SCHEMA_VERSION)
+            st, headers, data = self._json(status, rec)
+        except Exception:   # noqa: BLE001 — 0.6.1: 큰 message·비유한 details 등 오류 본문 생산이 실패하면 handle() 밖으로 새어 WSGI 서버의 일반 500이 된다. 값 없는 고정 503(상수라 실패할 수 없다)으로 한 번 복구한다
+            _log.error("오류 본문을 만들지 못해 고정 503으로 대신한다 (code=%s)", getattr(e, "code", None))
+            return 503, {"Content-Type": "application/json", "Cache-Control": "no-store"}, _FIXED_503
         if status == 401:
             headers["WWW-Authenticate"] = "Bearer"
         return st, headers, data
@@ -370,13 +382,15 @@ def _resolve(ref: str):
 
 
 def _errors(ref: str, value) -> list:
-    return [e.message for e in _resolve(ref).iter_errors(value)]
+    # 0.6.1: jsonschema 의 e.message 는 입력 원문을 담는다(INTERFACES I7). 위치와 키워드만 싣는다(계약 validate 의 details.errors 형식 "/경로: 내용")
+    # 경로는 instance 경로가 아니라 schema 경로(사용자가 정한 키도 싣지 않는다, 계약 validate 와 같은 원칙)
+    return sorted(f"{'/'.join(map(str, e.schema_path))}: {e.validator}" for e in _resolve(ref).iter_errors(value))
 
 
 def _validate(ref: str, value) -> None:
     errs = _errors(ref, value)
     if errs:
-        raise BoundaryError("INVALID_RECORD", f"{ref} 위반: {errs[0][:200]}")
+        raise BoundaryError("INVALID_RECORD", f"{ref} 계약 위반 {len(errs)}건", {"errors": errs[:5]})
 
 
 def _query(environ) -> dict:

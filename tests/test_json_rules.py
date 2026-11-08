@@ -104,3 +104,55 @@ def _deep(n: int):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ErrorBody(unittest.TestCase):
+    """0.6.1: 오류 본문 생산 실패는 고정 503, 스키마 위반 응답은 입력 원문을 싣지 않는다."""
+    CANARY = "CANARY-SECRET-7f3a"
+
+    def setUp(self):
+        from openit_link import HttpError
+        from boundary_contracts import BoundaryError
+
+        def boom(exc):
+            def h(r):
+                raise exc
+            return h
+        routes = [Route("GET", "/v1/big", boom(BoundaryError("INVALID_RECORD", "x" * (2**21))), roles=frozenset({"operator"})),
+                  Route("GET", "/v1/nan", boom(BoundaryError("INVALID_RECORD", "m", {"v": float("nan")})), roles=frozenset({"operator"})),
+                  Route("GET", "/v1/httperr", boom(HttpError(BoundaryError("INVALID_RECORD", "m", {"v": float("inf")}), {"X-A": "b"})), roles=frozenset({"operator"})),
+                  Route("POST", "/v1/schema", lambda r: Response(200, {}), roles=frozenset({"operator"}), request_schema="ActivateRequest")]
+        self.app = App(routes, TOK)
+
+    def call(self, method, path, body=b""):
+        import io
+        out = {}
+        env = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": "", "CONTENT_LENGTH": str(len(body)), "wsgi.input": io.BytesIO(body),
+               "HTTP_AUTHORIZATION": "Bearer op-token-0123456789", "CONTENT_TYPE": "application/json"}
+        st, headers, data = self.app.handle(env)
+        import json
+        return st, json.loads(b"".join(data) if not isinstance(data, bytes) else data)
+
+    def test_큰_message와_NaN_details는_고정_503(self):
+        for path in ("/v1/big", "/v1/nan", "/v1/httperr"):
+            st, rec = self.call("GET", path)
+            self.assertEqual((st, rec["code"], rec["message"]), (503, "UNAVAILABLE", "서버 내부 오류"), path)
+
+    def test_스키마_위반_응답에_입력_원문이_없다(self):
+        import json
+        st, rec = self.call("POST", "/v1/schema", json.dumps({"release_id": self.CANARY, "requested_by_role": self.CANARY}).encode())
+        self.assertEqual((st, rec["code"]), (400, "INVALID_RECORD"))
+        self.assertNotIn(self.CANARY, json.dumps(rec))
+        self.assertTrue(rec["details"]["errors"])
+
+    def test_예기치_않은_예외의_메시지는_로그에도_없다(self):
+        def bad(r):
+            raise RuntimeError(self.CANARY)
+        app = App([Route("GET", "/v1/crash", bad, roles=frozenset({"operator"}))], TOK)
+        self.app = app
+        with self.assertLogs("openit_link", level="ERROR") as cm:
+            st, rec = self.call("GET", "/v1/crash")
+        self.assertEqual((st, rec["code"]), (503, "UNAVAILABLE"))
+        logged = "\n".join(cm.output)
+        self.assertNotIn(self.CANARY, logged)
+        self.assertIn("RuntimeError", logged)
