@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
-from boundary_contracts import PIPELINE_SCHEMA_VERSION, BoundaryError, load_schema, validator
+from boundary_contracts import PIPELINE_SCHEMA_VERSION, BoundaryError, load_schema, strict_json, validator
 
 # CONVENTIONS 9절의 고정 표. 401은 PERMISSION_DENIED + details.http_status 401로 낸다(D106).
 STATUS = {"INVALID_RECORD": 400, "PERMISSION_DENIED": 403, "NOT_FOUND": 404, "CONFLICT": 409,
@@ -88,7 +88,7 @@ class App:
 
     def __init__(self, routes: list[Route], tokens: Mapping[str, str], *, ready: Optional[Callable[[], tuple]] = None,
                  user_header_trusted: bool = True, authenticate: Optional[Callable[[Mapping[str, str]], Optional[tuple]]] = None,
-                 ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = 64,
+                 ready_public: Optional[Callable[[dict], dict]] = None, max_json_depth: int = strict_json.MAX_JSON_DEPTH,
                  on_result: Optional[Callable[[dict], None]] = None,
                  contract_service: Optional[str] = None, contract_bindings: Optional[Mapping] = None):
         """authenticate(0.3.0): 토큰이 없을 때 부르는 추가 인증(예: 게이트웨이가 확인한 X-Openit-Device를 믿는 내부망 경로, ADR 0012).
@@ -196,7 +196,7 @@ class App:
                 raise _unauth("사람 행위자(X-Openit-User)가 없다")
             body = None
             if raw and not route.raw_body:
-                body = _strict_json(raw, self._max_depth)
+                body = strict_json.loads(raw, max_depth=self._max_depth, max_bytes=route.max_body)   # 0.6.0: 계약 JSON 공통 규칙(CONVENTIONS 10절)의 정본. 413은 위 _read가 먼저 내므로 여기 max_bytes는 같은 한도의 안전망이다(바이너리 raw_body·stream_body는 이 줄을 지나지 않는다)
             query = _query(environ)
             if self._contract:
                 from boundary_contracts.http_contracts import ContractViolation, AuthenticationRequired, AuthorizationDenied
@@ -301,7 +301,13 @@ class App:
 
     @staticmethod
     def _json(status: int, obj) -> tuple:
-        return status, {"Content-Type": "application/json", "Cache-Control": "no-store"}, json.dumps(obj, ensure_ascii=False).encode()
+        try:
+            data = strict_json.dumps(obj).encode("utf-8")   # 0.6.0: allow_nan=False + 계약 값 예산. 내는 쪽이 어기면 서버 결함이다(R7)
+        except BoundaryError:
+            raise BoundaryError("UNAVAILABLE", "응답이 계약 JSON 규칙(CONVENTIONS 10절)을 어긴다(서버 결함)") from None
+        if len(data) > strict_json.MAX_JSON_BYTES:
+            raise BoundaryError("UNAVAILABLE", "응답이 계약 JSON 본문 상한(1 MiB)을 넘는다(서버 결함)")
+        return status, {"Content-Type": "application/json", "Cache-Control": "no-store"}, data
 
     def _out(self, resp: Response) -> tuple:
         b = resp.body
@@ -347,62 +353,6 @@ class _Limited:
         data = self._f.read(size)
         self.remaining -= len(data)
         return data
-
-
-def _no_dup(pairs):
-    seen = {}
-    for k, v in pairs:
-        if k in seen:
-            raise ValueError(f"중복 키 {k!r}")
-        seen[k] = v
-    return seen
-
-
-def _depth(o, limit: int, d: int = 0) -> None:
-    if d > limit:
-        raise ValueError("중첩이 너무 깊다")
-    if isinstance(o, dict):
-        for v in o.values():
-            _depth(v, limit, d + 1)
-    elif isinstance(o, list):
-        for v in o:
-            _depth(v, limit, d + 1)
-
-
-def _strict_json(raw: bytes, max_depth: int):
-    """0.3.0: I-JSON(RFC 7493)에 맞춰 받는다 — UTF-8, 중복 키 거부, 짝 없는 서로게이트 거부, 중첩 상한. 어기면 400 INVALID_RECORD."""
-    try:
-        text = raw.decode("utf-8")
-        if raw.count(b"[") + raw.count(b"{") > max_depth and _bracket_depth(text) > max_depth:
-            raise ValueError("중첩이 너무 깊다")
-        obj = json.loads(text, object_pairs_hook=_no_dup)
-        json.dumps(obj, ensure_ascii=False).encode("utf-8")   # 짝 없는 서로게이트는 여기서 UnicodeEncodeError
-        _depth(obj, max_depth)
-        return obj
-    except (ValueError, UnicodeError, RecursionError) as e:
-        raise BoundaryError("INVALID_RECORD", f"본문이 올바른 JSON이 아니다: {str(e)[:120]}") from None
-
-
-def _bracket_depth(text: str) -> int:
-    """문자열 밖의 괄호 깊이(재귀 없이). json.loads가 깊은 중첩에서 RecursionError로 죽기 전에 거른다."""
-    d = m = 0
-    in_str = esc = False
-    for ch in text:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-        elif ch in "[{":
-            d += 1
-            m = max(m, d)
-        elif ch in "]}":
-            d -= 1
-    return m
 
 
 def _resolve(ref: str):
