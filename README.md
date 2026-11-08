@@ -7,7 +7,7 @@
 - **보내는 쪽** `openit_link.clients`: 계약 패키지의 HTTP 클라이언트를 그대로 다시 내보낸다.
 
 ## 2. 의존
-- boundary-contracts v5.0.0(고정, 정본은 pyproject.toml). waitress로 띄우는 것은 영역의 몫(이 라이브러리는 표준 WSGI 인터페이스 PEP 3333만 쓴다).
+- boundary-contracts v5.0.1(고정, 정본은 pyproject.toml). waitress로 띄우는 것은 영역의 몫(이 라이브러리는 표준 WSGI 인터페이스 PEP 3333만 쓴다).
 
 ## 3. 결정 기록
 - [ADR 0001: 받는 쪽은 WSGI 앱 하나로](docs/adr/0001-받는-쪽은-WSGI-앱.md)
